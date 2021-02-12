@@ -5,7 +5,7 @@
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3, start/1, start/2,
-         start_link/1, start_link/2, stop/1, status/1]).
+         start_link/1, start_link/2, stop/1, status/1, add_worker/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 -export_type([pool/0]).
@@ -130,6 +130,10 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+-spec add_worker(Pool :: pool()) -> ok.
+add_worker(Pool) ->
+    gen_server:cast(Pool, add_worker).
+
 init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
@@ -181,6 +185,11 @@ handle_cast({cancel_waiting, CRef}, State) ->
             Waiting = queue:filter(Cancel, State#state.waiting),
             {noreply, State#state{waiting = Waiting}}
     end;
+
+handle_cast(add_worker, State) ->
+    {noreply, State#state{
+        workers = [new_worker(State#state.supervisor) | State#state.workers],
+        size = State#state.size + 1}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
