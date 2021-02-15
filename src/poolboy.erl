@@ -44,7 +44,10 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    overflow_ttl = 0 :: non_neg_integer(),
+    last_overflow_ts = 0 :: non_neg_integer(),
+    overflow_clean_timer = undefined :: undefined | reference()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -151,6 +154,8 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{overflow_ttl, OverflowTtl} | Rest], WorkerArgs, State) when is_integer(OverflowTtl) ->
+    init(Rest, WorkerArgs, State#state{overflow_ttl = OverflowTtl});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
@@ -204,11 +209,16 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
         [Pid | Left] ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left}};
+            case ets:info(Monitors, size) > State#state.size of
+                true ->
+                    {reply, Pid, State#state{workers = Left, last_overflow_ts = erlang:system_time(millisecond)}};
+                false ->
+                    {reply, Pid, State#state{workers = Left}}
+            end;
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
+            {reply, Pid, State#state{overflow = Overflow + 1, last_overflow_ts = erlang:system_time(millisecond)}};
         [] when Block =:= false ->
             {reply, full, State};
         [] ->
@@ -269,6 +279,24 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             end
     end;
 
+handle_info(overflow_clean,
+    #state{
+        supervisor = Sup,
+        workers = Workers,
+        overflow = Overflow,
+        overflow_ttl = OverflowTtl,
+        overflow_clean_timer = Timer,
+        last_overflow_ts = LastTS} = State) ->
+    erlang:cancel_timer(Timer),
+    case erlang:system_time(millisecond) - LastTS > OverflowTtl of
+        true when length(Workers) >= Overflow ->
+            NewWorkers = dismiss_workers(Overflow, Sup, Workers),
+            {noreply, State#state{workers = NewWorkers, overflow = 0, overflow_clean_timer = undefined}};
+        _ ->
+            Timer2 = erlang:send_after(OverflowTtl, self(), overflow_clean),
+            {noreply, State#state{overflow_clean_timer = Timer2}}
+    end;
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -298,6 +326,12 @@ new_worker(Sup, FromPid) ->
     Ref = erlang:monitor(process, FromPid),
     {Pid, Ref}.
 
+dismiss_workers(0, _Sup, Workers) ->
+    Workers;
+dismiss_workers(N, Sup, [Pid | Left]) ->
+    ok = dismiss_worker(Sup, Pid),
+    dismiss_workers(N - 1, Sup, Left).
+
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
     supervisor:terminate_child(Sup, Pid).
@@ -317,20 +351,28 @@ handle_checkin(Pid, State) ->
            waiting = Waiting,
            monitors = Monitors,
            overflow = Overflow,
+           overflow_ttl = OverflowTtl,
+           overflow_clean_timer = OverflowCleanTimer,
            strategy = Strategy} = State,
+    Workers =
+        case Strategy of
+            lifo -> [Pid | State#state.workers];
+            fifo -> State#state.workers ++ [Pid]
+        end,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
+        {empty, Empty} when Overflow > 0 andalso OverflowTtl > 0 andalso OverflowCleanTimer =:= undefined ->
+            Timer = erlang:send_after(OverflowTtl, self(), overflow_clean),
+            State#state{workers = Workers, waiting = Empty, overflow_clean_timer = Timer};
+        {empty, Empty} when Overflow > 0 andalso OverflowTtl > 0 ->
+            State#state{workers = Workers, waiting = Empty};
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
-            Workers = case Strategy of
-                lifo -> [Pid | State#state.workers];
-                fifo -> State#state.workers ++ [Pid]
-            end,
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
 
